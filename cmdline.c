@@ -237,6 +237,33 @@ int cmdline_process_param(const char *p, char *value,
 	SAVEABLE(0);
 	conf_set_str(conf, CONF_loghost, value);
     }
+	if (!strcmp(p, "-codepage")) {
+		RETURN(2);
+		UNAVAILABLE_IN(TOOLTYPE_NONNETWORK);
+		SAVEABLE(0);
+		conf_set_str(conf, CONF_line_codepage, value);
+	}
+	if (!strcmp(p, "-fontname")) {
+		FontSpec *fs;
+		RETURN(2);
+		UNAVAILABLE_IN(TOOLTYPE_NONNETWORK);
+		SAVEABLE(0);
+		fs=conf_get_fontspec(conf,CONF_font);
+		fs->name= dupstr(value);
+		conf_set_fontspec( conf,CONF_font,fs);
+
+	}
+	if (!strcmp(p, "-fontsize")) {
+		FontSpec *fs;
+		RETURN(2);
+		UNAVAILABLE_IN(TOOLTYPE_NONNETWORK);
+		SAVEABLE(0);
+		fs=conf_get_fontspec(conf,CONF_font);
+		fs->height=atoi(value);
+		conf_set_fontspec( conf,CONF_font,fs);
+
+	}
+
     if (!strcmp(p, "-hostkey")) {
         char *dup;
 	RETURN(2);
