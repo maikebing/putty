@@ -44,19 +44,7 @@
 #include <X11/Xatom.h>
 #endif
 
-#define CAT2(x,y) x ## y
-#define CAT(x,y) CAT2(x,y)
-#define ASSERT(x) enum {CAT(assertion_,__LINE__) = 1 / (x)}
-
-#if GTK_CHECK_VERSION(2,0,0)
-ASSERT(sizeof(long) <= sizeof(gsize));
-#define LONG_TO_GPOINTER(l) GSIZE_TO_POINTER(l)
-#define GPOINTER_TO_LONG(p) GPOINTER_TO_SIZE(p)
-#else /* Gtk 1.2 */
-ASSERT(sizeof(long) <= sizeof(gpointer));
-#define LONG_TO_GPOINTER(l) ((gpointer)(long)(l))
-#define GPOINTER_TO_LONG(p) ((long)(p))
-#endif
+#include "x11misc.h"
 
 /* Colours come in two flavours: configurable, and xterm-extended. */
 #define NEXTCOLOURS 240 /* 216 colour-cube plus 24 shades of grey */
@@ -64,20 +52,11 @@ ASSERT(sizeof(long) <= sizeof(gpointer));
 
 GdkAtom compound_text_atom, utf8_string_atom;
 
-extern char **pty_argv;	       /* declared in pty.c */
-extern int use_pty_argv;
-
-/*
- * Timers are global across all sessions (even if we were handling
- * multiple sessions, which we aren't), so the current timer ID is
- * a global variable.
- */
-static guint timer_id = 0;
-
 struct clipboard_data_instance;
 
 struct gui_data {
     GtkWidget *window, *area, *sbar;
+    gboolean sbar_visible;
     GtkBox *hbox;
     GtkAdjustment *sbar_adjust;
     GtkWidget *menu, *specialsmenu, *specialsitem1, *specialsitem2,
@@ -115,11 +94,7 @@ struct gui_data {
     GtkIMContext *imc;
 #endif
     unifont *fonts[4];                 /* normal, bold, wide, widebold */
-#if GTK_CHECK_VERSION(2,0,0)
-    const char *geometry;
-#else
     int xpos, ypos, gotpos, gravity;
-#endif
     GdkCursor *rawcursor, *textcursor, *blankcursor, *waitcursor, *currcursor;
     GdkColor cols[NALLCOLOURS];
 #if !GTK_CHECK_VERSION(3,0,0)
@@ -140,8 +115,6 @@ struct gui_data {
     int ignore_sbar;
     int mouseptr_visible;
     int busy_status;
-    guint toplevel_callback_idle_id;
-    int idle_fn_scheduled, quit_fn_scheduled;
     int alt_keycode;
     int alt_digits;
     char *wintitle;
@@ -156,8 +129,6 @@ struct gui_data {
     struct unicode_data ucsdata;
     Conf *conf;
     void *eventlogstuff;
-    char *progname, **gtkargvstart;
-    int ngtkargs;
     guint32 input_event_time; /* Timestamp of the most recent input event. */
     int reconfiguring;
 #if GTK_CHECK_VERSION(3,4,0)
@@ -194,20 +165,8 @@ struct draw_ctx {
 
 static int send_raw_mouse;
 
-static const char *app_name = "pterm";
-
 static void start_backend(struct gui_data *inst);
 static void exit_callback(void *vinst);
-
-char *x_get_default(const char *key)
-{
-#ifndef NOT_X_WINDOWS
-    return XGetDefault(GDK_DISPLAY_XDISPLAY(gdk_display_get_default()),
-                       app_name, key);
-#else
-    return NULL;
-#endif
-}
 
 void connection_fatal(void *frontend, const char *p, ...)
 {
@@ -378,6 +337,8 @@ void move_window(void *frontend, int x, int y)
      * though.
      */
 #if GTK_CHECK_VERSION(2,0,0)
+    /* in case we reset this at startup due to a geometry string */
+    gtk_window_set_gravity(GTK_WINDOW(inst->window), GDK_GRAVITY_NORTH_EAST);
     gtk_window_move(GTK_WINDOW(inst->window), x, y);
 #else
     gdk_window_move(gtk_widget_get_window(inst->window), x, y);
@@ -2012,205 +1973,12 @@ static void exit_callback(void *vinst)
     }
 }
 
-/*
- * Replacement code for the gtk_quit_add() function, which GTK2 - in
- * their unbounded wisdom - deprecated without providing any usable
- * replacement, and which we were using to ensure that our idle
- * function for toplevel callbacks was only run from the outermost
- * gtk_main().
- *
- * We maintain a global variable with a list of 'struct gui_data'
- * instances on which we should call inst_post_main() when a
- * subsidiary gtk_main() terminates; then we must make sure that all
- * our subsidiary calls to gtk_main() are followed by a call to
- * post_main().
- *
- * This is kind of overkill in the sense that at the time of writing
- * we don't actually ever run more than one 'struct gui_data' instance
- * in the same process, but we're _so nearly_ prepared to do that that
- * I want to remain futureproof against the possibility of doing so in
- * future.
- */
-struct post_main_context {
-    struct post_main_context *next;
-    struct gui_data *inst;
-};
-struct post_main_context *post_main_list_head = NULL;
-static void request_post_main(struct gui_data *inst)
-{
-    struct post_main_context *node = snew(struct post_main_context);
-    node->next = post_main_list_head;
-    node->inst = inst;
-    post_main_list_head = node;
-}
-static void inst_post_main(struct gui_data *inst);
-void post_main(void)
-{
-    while (post_main_list_head) {
-        struct post_main_context *node = post_main_list_head;
-        post_main_list_head = node->next;
-        inst_post_main(node->inst);
-        sfree(node);
-    }
-}
-
 void notify_remote_exit(void *frontend)
 {
     struct gui_data *inst = (struct gui_data *)frontend;
 
     queue_toplevel_callback(exit_callback, inst);
 }
-
-static void notify_toplevel_callback(void *frontend);
-
-static void inst_post_main(struct gui_data *inst)
-{
-    if (gtk_main_level() == 1) {
-        notify_toplevel_callback(inst);
-        inst->quit_fn_scheduled = FALSE;
-    } else {
-        /* Apparently we're _still_ more than one level deep in
-         * gtk_main() instances, so we'll need another callback for
-         * when we get out of the next one. */
-        request_post_main(inst);
-    }
-}
-
-static gint idle_toplevel_callback_func(gpointer data)
-{
-    struct gui_data *inst = (struct gui_data *)data;
-
-    if (gtk_main_level() > 1) {
-        /*
-         * We don't run the callbacks if we're in the middle of a
-         * subsidiary gtk_main. Instead, ask for a callback when we
-         * get back out of the subsidiary main loop (if we haven't
-         * already arranged one), so we can reschedule ourself then.
-         */
-        if (!inst->quit_fn_scheduled) {
-            request_post_main(inst);
-            inst->quit_fn_scheduled = TRUE;
-        }
-        /*
-         * And unschedule this idle function, since we've now done
-         * everything we can until the innermost gtk_main has quit and
-         * can reschedule us with a chance of actually taking action.
-         */
-        if (inst->idle_fn_scheduled) { /* double-check, just in case */
-            g_source_remove(inst->toplevel_callback_idle_id);
-            inst->idle_fn_scheduled = FALSE;
-        }
-    } else {
-        run_toplevel_callbacks();
-    }
-
-    /*
-     * If we've emptied our toplevel callback queue, unschedule
-     * ourself. Otherwise, leave ourselves pending so we'll be called
-     * again to deal with more callbacks after another round of the
-     * event loop.
-     */
-    if (!toplevel_callback_pending() && inst->idle_fn_scheduled) {
-        g_source_remove(inst->toplevel_callback_idle_id);
-        inst->idle_fn_scheduled = FALSE;
-    }
-
-    return TRUE;
-}
-
-static void notify_toplevel_callback(void *frontend)
-{
-    struct gui_data *inst = (struct gui_data *)frontend;
-
-    if (!inst->idle_fn_scheduled) {
-        inst->toplevel_callback_idle_id =
-            g_idle_add(idle_toplevel_callback_func, inst);
-        inst->idle_fn_scheduled = TRUE;
-    }
-}
-
-static gint timer_trigger(gpointer data)
-{
-    unsigned long now = GPOINTER_TO_LONG(data);
-    unsigned long next, then;
-    long ticks;
-
-    /*
-     * Destroy the timer we got here on.
-     */
-    if (timer_id) {
-	g_source_remove(timer_id);
-        timer_id = 0;
-    }
-
-    /*
-     * run_timers() may cause a call to timer_change_notify, in which
-     * case a new timer will already have been set up and left in
-     * timer_id. If it hasn't, and run_timers reports that some timing
-     * still needs to be done, we do it ourselves.
-     */
-    if (run_timers(now, &next) && !timer_id) {
-	then = now;
-	now = GETTICKCOUNT();
-	if (now - then > next - then)
-	    ticks = 0;
-	else
-	    ticks = next - now;
-	timer_id = g_timeout_add(ticks, timer_trigger, LONG_TO_GPOINTER(next));
-    }
-
-    /*
-     * Returning FALSE means 'don't call this timer again', which
-     * _should_ be redundant given that we removed it above, but just
-     * in case, return FALSE anyway.
-     */
-    return FALSE;
-}
-
-void timer_change_notify(unsigned long next)
-{
-    long ticks;
-
-    if (timer_id)
-	g_source_remove(timer_id);
-
-    ticks = next - GETTICKCOUNT();
-    if (ticks <= 0)
-	ticks = 1;		       /* just in case */
-
-    timer_id = g_timeout_add(ticks, timer_trigger, LONG_TO_GPOINTER(next));
-}
-
-#if GTK_CHECK_VERSION(2,0,0)
-gboolean fd_input_func(GIOChannel *source, GIOCondition condition,
-                       gpointer data)
-{
-    int sourcefd = g_io_channel_unix_get_fd(source);
-    /*
-     * We must process exceptional notifications before ordinary
-     * readability ones, or we may go straight past the urgent
-     * marker.
-     */
-    if (condition & G_IO_PRI)
-        select_result(sourcefd, 4);
-    if (condition & G_IO_IN)
-        select_result(sourcefd, 1);
-    if (condition & G_IO_OUT)
-        select_result(sourcefd, 2);
-
-    return TRUE;
-}
-#else
-void fd_input_func(gpointer data, gint sourcefd, GdkInputCondition condition)
-{
-    if (condition & GDK_INPUT_EXCEPTION)
-        select_result(sourcefd, 4);
-    if (condition & GDK_INPUT_READ)
-        select_result(sourcefd, 1);
-    if (condition & GDK_INPUT_WRITE)
-        select_result(sourcefd, 2);
-}
-#endif
 
 void destroy(GtkWidget *widget, gpointer data)
 {
@@ -2243,6 +2011,12 @@ void set_raw_mouse_mode(void *frontend, int activate)
     send_raw_mouse = activate;
     update_mouseptr(inst);
 }
+
+#if GTK_CHECK_VERSION(2,0,0)
+static void compute_whole_window_size(struct gui_data *inst,
+                                      int wchars, int hchars,
+                                      int *wpix, int *hpix);
+#endif
 
 void request_resize(void *frontend, int w, int h)
 {
@@ -2325,14 +2099,9 @@ void request_resize(void *frontend, int w, int h)
 
 #else /* GTK_CHECK_VERSION(3,0,0) */
 
-    /*
-     * In GTK3, we can do this by using gtk_window_resize_to_geometry,
-     * which uses the fact that we've already set up the main window's
-     * WM hints to reflect the terminal drawing area's resize
-     * increment (i.e. character cell) and the fixed amount of stuff
-     * round the edges.
-     */
-    gtk_window_resize_to_geometry(GTK_WINDOW(inst->window), w, h);
+    int wp, hp;
+    compute_whole_window_size(inst, w, h, &wp, &hp);
+    gtk_window_resize(GTK_WINDOW(inst->window), wp, hp);
 
 #endif
 
@@ -2961,20 +2730,28 @@ void init_clipboard(struct gui_data *inst)
      */
     unsigned char empty[] = "";
     Display *disp = GDK_DISPLAY_XDISPLAY(gdk_display_get_default());
+    x11_ignore_error(disp, BadMatch);
     XChangeProperty(disp, GDK_ROOT_WINDOW(),
 		    XA_CUT_BUFFER0, XA_STRING, 8, PropModeAppend, empty, 0);
+    x11_ignore_error(disp, BadMatch);
     XChangeProperty(disp, GDK_ROOT_WINDOW(),
 		    XA_CUT_BUFFER1, XA_STRING, 8, PropModeAppend, empty, 0);
+    x11_ignore_error(disp, BadMatch);
     XChangeProperty(disp, GDK_ROOT_WINDOW(),
 		    XA_CUT_BUFFER2, XA_STRING, 8, PropModeAppend, empty, 0);
+    x11_ignore_error(disp, BadMatch);
     XChangeProperty(disp, GDK_ROOT_WINDOW(),
 		    XA_CUT_BUFFER3, XA_STRING, 8, PropModeAppend, empty, 0);
+    x11_ignore_error(disp, BadMatch);
     XChangeProperty(disp, GDK_ROOT_WINDOW(),
 		    XA_CUT_BUFFER4, XA_STRING, 8, PropModeAppend, empty, 0);
+    x11_ignore_error(disp, BadMatch);
     XChangeProperty(disp, GDK_ROOT_WINDOW(),
 		    XA_CUT_BUFFER5, XA_STRING, 8, PropModeAppend, empty, 0);
+    x11_ignore_error(disp, BadMatch);
     XChangeProperty(disp, GDK_ROOT_WINDOW(),
 		    XA_CUT_BUFFER6, XA_STRING, 8, PropModeAppend, empty, 0);
+    x11_ignore_error(disp, BadMatch);
     XChangeProperty(disp, GDK_ROOT_WINDOW(),
 		    XA_CUT_BUFFER7, XA_STRING, 8, PropModeAppend, empty, 0);
 #endif
@@ -3055,7 +2832,9 @@ void set_sbar(void *frontend, int total, int start, int page)
     gtk_adjustment_set_step_increment(inst->sbar_adjust, 1);
     gtk_adjustment_set_page_increment(inst->sbar_adjust, page/2);
     inst->ignore_sbar = TRUE;
+#if !GTK_CHECK_VERSION(3,18,0)
     gtk_adjustment_changed(inst->sbar_adjust);
+#endif
     inst->ignore_sbar = FALSE;
 }
 
@@ -3067,6 +2846,15 @@ void scrollbar_moved(GtkAdjustment *adj, gpointer data)
 	return;
     if (!inst->ignore_sbar)
 	term_scroll(inst->term, 1, (int)gtk_adjustment_get_value(adj));
+}
+
+static void show_scrollbar(struct gui_data *inst, gboolean visible)
+{
+    inst->sbar_visible = visible;
+    if (visible)
+        gtk_widget_show(inst->sbar);
+    else
+        gtk_widget_hide(inst->sbar);
 }
 
 void sys_cursor(void *frontend, int x, int y)
@@ -3732,340 +3520,6 @@ long get_windowid(void *frontend)
 }
 #endif
 
-static void help(FILE *fp) {
-    if(fprintf(fp,
-"pterm option summary:\n"
-"\n"
-"  --display DISPLAY         Specify X display to use (note '--')\n"
-"  -name PREFIX              Prefix when looking up resources (default: pterm)\n"
-"  -fn FONT                  Normal text font\n"
-"  -fb FONT                  Bold text font\n"
-"  -geometry GEOMETRY        Position and size of window (size in characters)\n"
-"  -sl LINES                 Number of lines of scrollback\n"
-"  -fg COLOUR, -bg COLOUR    Foreground/background colour\n"
-"  -bfg COLOUR, -bbg COLOUR  Foreground/background bold colour\n"
-"  -cfg COLOUR, -bfg COLOUR  Foreground/background cursor colour\n"
-"  -T TITLE                  Window title\n"
-"  -ut, +ut                  Do(default) or do not update utmp\n"
-"  -ls, +ls                  Do(default) or do not make shell a login shell\n"
-"  -sb, +sb                  Do(default) or do not display a scrollbar\n"
-"  -log PATH, -sessionlog PATH  Log all output to a file\n"
-"  -nethack                  Map numeric keypad to hjklyubn direction keys\n"
-"  -xrm RESOURCE-STRING      Set an X resource\n"
-"  -e COMMAND [ARGS...]      Execute command (consumes all remaining args)\n"
-	 ) < 0 || fflush(fp) < 0) {
-	perror("output error");
-	exit(1);
-    }
-}
-
-static void version(FILE *fp) {
-    if(fprintf(fp, "%s: %s\n", appname, ver) < 0 || fflush(fp) < 0) {
-	perror("output error");
-	exit(1);
-    }
-}
-
-int do_cmdline(int argc, char **argv, int do_everything, int *allow_launch,
-               struct gui_data *inst, Conf *conf)
-{
-    int err = 0;
-    char *val;
-
-    /*
-     * Macros to make argument handling easier. Note that because
-     * they need to call `continue', they cannot be contained in
-     * the usual do {...} while (0) wrapper to make them
-     * syntactically single statements; hence it is not legal to
-     * use one of these macros as an unbraced statement between
-     * `if' and `else'.
-     */
-#define EXPECTS_ARG { \
-    if (--argc <= 0) { \
-	err = 1; \
-	fprintf(stderr, "%s: %s expects an argument\n", appname, p); \
-        continue; \
-    } else \
-	val = *++argv; \
-}
-#define SECOND_PASS_ONLY { if (!do_everything) continue; }
-
-    while (--argc > 0) {
-	const char *p = *++argv;
-        int ret;
-
-	/*
-	 * Shameless cheating. Debian requires all X terminal
-	 * emulators to support `-T title'; but
-	 * cmdline_process_param will eat -T (it means no-pty) and
-	 * complain that pterm doesn't support it. So, in pterm
-	 * only, we convert -T into -title.
-	 */
-	if ((cmdline_tooltype & TOOLTYPE_NONNETWORK) &&
-	    !strcmp(p, "-T"))
-	    p = "-title";
-
-        ret = cmdline_process_param(p, (argc > 1 ? argv[1] : NULL),
-                                    do_everything ? 1 : -1, conf);
-
-	if (ret == -2) {
-	    cmdline_error("option \"%s\" requires an argument", p);
-	} else if (ret == 2) {
-	    --argc, ++argv;            /* skip next argument */
-            continue;
-	} else if (ret == 1) {
-            continue;
-        }
-
-	if (!strcmp(p, "-fn") || !strcmp(p, "-font")) {
-	    FontSpec *fs;
-	    EXPECTS_ARG;
-	    SECOND_PASS_ONLY;
-            fs = fontspec_new(val);
-	    conf_set_fontspec(conf, CONF_font, fs);
-            fontspec_free(fs);
-
-	} else if (!strcmp(p, "-fb")) {
-	    FontSpec *fs;
-	    EXPECTS_ARG;
-	    SECOND_PASS_ONLY;
-            fs = fontspec_new(val);
-	    conf_set_fontspec(conf, CONF_boldfont, fs);
-            fontspec_free(fs);
-
-	} else if (!strcmp(p, "-fw")) {
-	    FontSpec *fs;
-	    EXPECTS_ARG;
-	    SECOND_PASS_ONLY;
-            fs = fontspec_new(val);
-	    conf_set_fontspec(conf, CONF_widefont, fs);
-            fontspec_free(fs);
-
-	} else if (!strcmp(p, "-fwb")) {
-	    FontSpec *fs;
-	    EXPECTS_ARG;
-	    SECOND_PASS_ONLY;
-            fs = fontspec_new(val);
-	    conf_set_fontspec(conf, CONF_wideboldfont, fs);
-            fontspec_free(fs);
-
-	} else if (!strcmp(p, "-cs")) {
-	    EXPECTS_ARG;
-	    SECOND_PASS_ONLY;
-	    conf_set_str(conf, CONF_line_codepage, val);
-
-	} else if (!strcmp(p, "-geometry")) {
-	    EXPECTS_ARG;
-	    SECOND_PASS_ONLY;
-
-#if GTK_CHECK_VERSION(2,0,0)
-            inst->geometry = val;
-#else
-            /* On GTK 1, we have to do this using raw Xlib */
-            {
-                int flags, x, y;
-                unsigned int w, h;
-                flags = XParseGeometry(val, &x, &y, &w, &h);
-                if (flags & WidthValue)
-                    conf_set_int(conf, CONF_width, w);
-                if (flags & HeightValue)
-                    conf_set_int(conf, CONF_height, h);
-
-                if (flags & (XValue | YValue)) {
-                    inst->xpos = x;
-                    inst->ypos = y;
-                    inst->gotpos = TRUE;
-                    inst->gravity = ((flags & XNegative ? 1 : 0) |
-                                     (flags & YNegative ? 2 : 0));
-                }
-            }
-#endif
-
-	} else if (!strcmp(p, "-sl")) {
-	    EXPECTS_ARG;
-	    SECOND_PASS_ONLY;
-	    conf_set_int(conf, CONF_savelines, atoi(val));
-
-	} else if (!strcmp(p, "-fg") || !strcmp(p, "-bg") ||
-		   !strcmp(p, "-bfg") || !strcmp(p, "-bbg") ||
-		   !strcmp(p, "-cfg") || !strcmp(p, "-cbg")) {
-	    EXPECTS_ARG;
-	    SECOND_PASS_ONLY;
-
-            {
-#if GTK_CHECK_VERSION(3,0,0)
-                GdkRGBA rgba;
-                int success = gdk_rgba_parse(&rgba, val);
-#else
-                GdkColor col;
-                int success = gdk_color_parse(val, &col);
-#endif
-
-                if (!success) {
-                    err = 1;
-                    fprintf(stderr, "%s: unable to parse colour \"%s\"\n",
-                            appname, val);
-                } else {
-#if GTK_CHECK_VERSION(3,0,0)
-                    int r = rgba.red * 255;
-                    int g = rgba.green * 255;
-                    int b = rgba.blue * 255;
-#else
-                    int r = col.red / 256;
-                    int g = col.green / 256;
-                    int b = col.blue / 256;
-#endif
-
-                    int index;
-                    index = (!strcmp(p, "-fg") ? 0 :
-                             !strcmp(p, "-bg") ? 2 :
-                             !strcmp(p, "-bfg") ? 1 :
-                             !strcmp(p, "-bbg") ? 3 :
-                             !strcmp(p, "-cfg") ? 4 :
-                             !strcmp(p, "-cbg") ? 5 : -1);
-                    assert(index != -1);
-
-                    conf_set_int_int(conf, CONF_colours, index*3+0, r);
-                    conf_set_int_int(conf, CONF_colours, index*3+1, g);
-                    conf_set_int_int(conf, CONF_colours, index*3+2, b);
-                }
-            }
-
-	} else if (use_pty_argv && !strcmp(p, "-e")) {
-	    /* This option swallows all further arguments. */
-	    if (!do_everything)
-		break;
-
-	    if (--argc > 0) {
-		int i;
-		pty_argv = snewn(argc+1, char *);
-		++argv;
-		for (i = 0; i < argc; i++)
-		    pty_argv[i] = argv[i];
-		pty_argv[argc] = NULL;
-		break;		       /* finished command-line processing */
-	    } else
-		err = 1, fprintf(stderr, "%s: -e expects an argument\n",
-                                 appname);
-
-	} else if (!strcmp(p, "-title")) {
-	    EXPECTS_ARG;
-	    SECOND_PASS_ONLY;
-	    conf_set_str(conf, CONF_wintitle, val);
-
-	} else if (!strcmp(p, "-log")) {
-	    Filename *fn;
-	    EXPECTS_ARG;
-	    SECOND_PASS_ONLY;
-            fn = filename_from_str(val);
-	    conf_set_filename(conf, CONF_logfilename, fn);
-	    conf_set_int(conf, CONF_logtype, LGTYP_DEBUG);
-            filename_free(fn);
-
-	} else if (!strcmp(p, "-ut-") || !strcmp(p, "+ut")) {
-	    SECOND_PASS_ONLY;
-	    conf_set_int(conf, CONF_stamp_utmp, 0);
-
-	} else if (!strcmp(p, "-ut")) {
-	    SECOND_PASS_ONLY;
-	    conf_set_int(conf, CONF_stamp_utmp, 1);
-
-	} else if (!strcmp(p, "-ls-") || !strcmp(p, "+ls")) {
-	    SECOND_PASS_ONLY;
-	    conf_set_int(conf, CONF_login_shell, 0);
-
-	} else if (!strcmp(p, "-ls")) {
-	    SECOND_PASS_ONLY;
-	    conf_set_int(conf, CONF_login_shell, 1);
-
-	} else if (!strcmp(p, "-nethack")) {
-	    SECOND_PASS_ONLY;
-	    conf_set_int(conf, CONF_nethack_keypad, 1);
-
-	} else if (!strcmp(p, "-sb-") || !strcmp(p, "+sb")) {
-	    SECOND_PASS_ONLY;
-	    conf_set_int(conf, CONF_scrollbar, 0);
-
-	} else if (!strcmp(p, "-sb")) {
-	    SECOND_PASS_ONLY;
-	    conf_set_int(conf, CONF_scrollbar, 1);
-
-	} else if (!strcmp(p, "-name")) {
-	    EXPECTS_ARG;
-	    app_name = val;
-
-	} else if (!strcmp(p, "-xrm")) {
-	    EXPECTS_ARG;
-	    provide_xrm_string(val);
-
-	} else if(!strcmp(p, "-help") || !strcmp(p, "--help")) {
-	    help(stdout);
-	    exit(0);
-
-	} else if(!strcmp(p, "-version") || !strcmp(p, "--version")) {
-	    version(stdout);
-	    exit(0);
-
-        } else if (!strcmp(p, "-pgpfp")) {
-            pgp_fingerprints();
-            exit(1);
-
-	} else if(p[0] != '-' && (!do_everything ||
-                                  process_nonoption_arg(p, conf,
-							allow_launch))) {
-            /* do nothing */
-
-	} else {
-	    err = 1;
-	    fprintf(stderr, "%s: unrecognized option '%s'\n", appname, p);
-	}
-    }
-
-    return err;
-}
-
-struct uxsel_id {
-#if GTK_CHECK_VERSION(2,0,0)
-    GIOChannel *chan;
-    guint watch_id;
-#else
-    int id;
-#endif
-};
-
-uxsel_id *uxsel_input_add(int fd, int rwx) {
-    uxsel_id *id = snew(uxsel_id);
-
-#if GTK_CHECK_VERSION(2,0,0)
-    int flags = 0;
-    if (rwx & 1) flags |= G_IO_IN;
-    if (rwx & 2) flags |= G_IO_OUT;
-    if (rwx & 4) flags |= G_IO_PRI;
-    id->chan = g_io_channel_unix_new(fd);
-    g_io_channel_set_encoding(id->chan, NULL, NULL);
-    id->watch_id = g_io_add_watch(id->chan, flags, fd_input_func, NULL);
-#else
-    int flags = 0;
-    if (rwx & 1) flags |= GDK_INPUT_READ;
-    if (rwx & 2) flags |= GDK_INPUT_WRITE;
-    if (rwx & 4) flags |= GDK_INPUT_EXCEPTION;
-    assert(flags);
-    id->id = gdk_input_add(fd, flags, fd_input_func, NULL);
-#endif
-
-    return id;
-}
-
-void uxsel_input_remove(uxsel_id *id) {
-#if GTK_CHECK_VERSION(2,0,0)
-    g_source_remove(id->watch_id);
-    g_io_channel_unref(id->chan);
-#else
-    gdk_input_remove(id->id);
-#endif
-    sfree(id);
-}
-
 int frontend_is_utf8(void *frontend)
 {
     struct gui_data *inst = (struct gui_data *)frontend;
@@ -4153,21 +3607,143 @@ char *setup_fonts_ucs(struct gui_data *inst)
     return NULL;
 }
 
+#if GTK_CHECK_VERSION(3,0,0)
+struct find_app_menu_bar_ctx {
+    GtkWidget *area, *menubar;
+};
+static void find_app_menu_bar(GtkWidget *widget, gpointer data)
+{
+    struct find_app_menu_bar_ctx *ctx = (struct find_app_menu_bar_ctx *)data;
+    if (widget != ctx->area && GTK_IS_MENU_BAR(widget))
+        ctx->menubar = widget;
+}
+#endif
+
+static void compute_geom_hints(struct gui_data *inst, GdkGeometry *geom)
+{
+    /*
+     * Unused fields in geom.
+     */
+    geom->max_width = geom->max_height = -1;
+    geom->min_aspect = geom->max_aspect = 0;
+
+    /*
+     * Set up the geometry fields we care about, with reference to
+     * just the drawing area. We'll correct for other widgets in a
+     * moment.
+     */
+    geom->min_width = inst->font_width + 2*inst->window_border;
+    geom->min_height = inst->font_height + 2*inst->window_border;
+    geom->base_width = 2*inst->window_border;
+    geom->base_height = 2*inst->window_border;
+    geom->width_inc = inst->font_width;
+    geom->height_inc = inst->font_height;
+
+    /*
+     * If we've got a scrollbar visible, then we must include its
+     * width as part of the base and min width, and also ensure that
+     * our window's minimum height is at least the height required by
+     * the scrollbar.
+     *
+     * In the latter case, we must also take care to arrange that
+     * (geom->min_height - geom->base_height) is an integer multiple of
+     * geom->height_inc, because if it's not, then some window managers
+     * (we know of xfwm4) get confused, with the effect that they
+     * resize our window to a height based on min_height instead of
+     * base_height, which we then round down and the window ends up
+     * too short.
+     */
+    if (inst->sbar_visible) {
+        GtkRequisition req;
+        int min_sb_height;
+
+#if GTK_CHECK_VERSION(3,0,0)
+        gtk_widget_get_preferred_size(inst->sbar, &req, NULL);
+#else
+        gtk_widget_size_request(inst->sbar, &req);
+#endif
+
+        /* Compute rounded-up scrollbar height. */
+        min_sb_height = req.height;
+        min_sb_height += geom->height_inc - 1;
+        min_sb_height -= ((min_sb_height - geom->base_height%geom->height_inc)
+                          % geom->height_inc);
+
+        geom->min_width += req.width;
+        geom->base_width += req.width;
+        if (geom->min_height < min_sb_height)
+            geom->min_height = min_sb_height;
+    }
+
+#if GTK_CHECK_VERSION(3,0,0)
+    /*
+     * And if we're running a gtkapp.c based program and
+     * GtkApplicationWindow has given us a menu bar inside the window,
+     * then we must take that into account as well.
+     *
+     * In its unbounded wisdom, GtkApplicationWindow doesn't actually
+     * give us a direct function call to _find_ the menu bar widget.
+     * Fortunately, we can find it by enumerating the children of the
+     * top-level window and looking for one we didn't put there
+     * ourselves.
+     */
+    {
+        struct find_app_menu_bar_ctx actx, *ctx = &actx;
+        ctx->area = inst->area;
+        ctx->menubar = NULL;
+        gtk_container_foreach(GTK_CONTAINER(inst->window),
+                              find_app_menu_bar, ctx);
+
+        if (ctx->menubar) {
+            GtkRequisition req;
+            int min_menu_width;
+            gtk_widget_get_preferred_size(ctx->menubar, NULL, &req);
+
+            /*
+             * This time, the height adjustment is easy (the menu bar
+             * sits above everything), but we have to take care with
+             * the _width_ to ensure we keep min_width and base_width
+             * congruent modulo width_inc.
+             */
+            geom->min_height += req.height;
+            geom->base_height += req.height;
+
+            min_menu_width = req.width;
+            min_menu_width += geom->width_inc - 1;
+            min_menu_width -=
+                ((min_menu_width - geom->base_width%geom->width_inc)
+                 % geom->width_inc);
+            if (geom->min_width < min_menu_width)
+                geom->min_width = min_menu_width;
+        }
+    }
+#endif
+}
+
 void set_geom_hints(struct gui_data *inst)
 {
     GdkGeometry geom;
-    geom.min_width = inst->font_width + 2*inst->window_border;
-    geom.min_height = inst->font_height + 2*inst->window_border;
-    geom.max_width = geom.max_height = -1;
-    geom.base_width = 2*inst->window_border;
-    geom.base_height = 2*inst->window_border;
-    geom.width_inc = inst->font_width;
-    geom.height_inc = inst->font_height;
-    geom.min_aspect = geom.max_aspect = 0;
-    gtk_window_set_geometry_hints(GTK_WINDOW(inst->window), inst->area, &geom,
-                                  GDK_HINT_MIN_SIZE | GDK_HINT_BASE_SIZE |
-                                  GDK_HINT_RESIZE_INC);
+    gint flags = GDK_HINT_MIN_SIZE | GDK_HINT_BASE_SIZE | GDK_HINT_RESIZE_INC;
+    compute_geom_hints(inst, &geom);
+#if GTK_CHECK_VERSION(2,0,0)
+    if (inst->gotpos)
+        flags |= GDK_HINT_USER_POS;
+#endif
+    gtk_window_set_geometry_hints(GTK_WINDOW(inst->window),
+                                  NULL, &geom, flags);
 }
+
+#if GTK_CHECK_VERSION(2,0,0)
+static void compute_whole_window_size(struct gui_data *inst,
+                                      int wchars, int hchars,
+                                      int *wpix, int *hpix)
+{
+    GdkGeometry geom;
+    compute_geom_hints(inst, &geom);
+    if (wpix) *wpix = geom.base_width + wchars * geom.width_inc;
+    if (hpix) *hpix = geom.base_height + hchars * geom.height_inc;
+}
+#endif
 
 void clear_scrollback_menuitem(GtkMenuItem *item, gpointer data)
 {
@@ -4289,16 +3865,16 @@ void change_settings_menuitem(GtkMenuItem *item, gpointer data)
 	    }
         }
 
+        need_size = FALSE;
+
         /*
          * If the scrollbar needs to be shown, hidden, or moved
          * from one end to the other of the window, do so now.
          */
         if (conf_get_int(oldconf, CONF_scrollbar) !=
 	    conf_get_int(newconf, CONF_scrollbar)) {
-            if (conf_get_int(newconf, CONF_scrollbar))
-                gtk_widget_show(inst->sbar);
-            else
-                gtk_widget_hide(inst->sbar);
+            show_scrollbar(inst, conf_get_int(newconf, CONF_scrollbar));
+            need_size = TRUE;
         }
         if (conf_get_int(oldconf, CONF_scrollbar_on_left) !=
 	    conf_get_int(newconf, CONF_scrollbar_on_left)) {
@@ -4319,7 +3895,6 @@ void change_settings_menuitem(GtkMenuItem *item, gpointer data)
          * Redo the whole tangled fonts and Unicode mess if
          * necessary.
          */
-        need_size = FALSE;
         if (strcmp(conf_get_fontspec(oldconf, CONF_font)->name,
 		   conf_get_fontspec(newconf, CONF_font)->name) ||
 	    strcmp(conf_get_fontspec(oldconf, CONF_boldfont)->name,
@@ -4345,7 +3920,7 @@ void change_settings_menuitem(GtkMenuItem *item, gpointer data)
                               errmsg);
                 messagebox(inst->window, "Font setup error", msgboxtext,
                            string_width("Could not change fonts in terminal window:"),
-                           "OK", 'o', +1, 1,
+                           FALSE, "OK", 'o', +1, 1,
                            NULL);
                 sfree(msgboxtext);
                 sfree(errmsg);
@@ -4397,200 +3972,16 @@ void change_settings_menuitem(GtkMenuItem *item, gpointer data)
     inst->reconfiguring = FALSE;
 }
 
-void fork_and_exec_self(struct gui_data *inst, int fd_to_close, ...)
-{
-    /*
-     * Re-execing ourself is not an exact science under Unix. I do
-     * the best I can by using /proc/self/exe if available and by
-     * assuming argv[0] can be found on $PATH if not.
-     * 
-     * Note that we also have to reconstruct the elements of the
-     * original argv which gtk swallowed, since the user wants the
-     * new session to appear on the same X display as the old one.
-     */
-    char **args;
-    va_list ap;
-    int i, n;
-    int pid;
-
-    /*
-     * Collect the arguments with which to re-exec ourself.
-     */
-    va_start(ap, fd_to_close);
-    n = 2;			       /* progname and terminating NULL */
-    n += inst->ngtkargs;
-    while (va_arg(ap, char *) != NULL)
-	n++;
-    va_end(ap);
-
-    args = snewn(n, char *);
-    args[0] = inst->progname;
-    args[n-1] = NULL;
-    for (i = 0; i < inst->ngtkargs; i++)
-	args[i+1] = inst->gtkargvstart[i];
-
-    i++;
-    va_start(ap, fd_to_close);
-    while ((args[i++] = va_arg(ap, char *)) != NULL);
-    va_end(ap);
-
-    assert(i == n);
-
-    /*
-     * Do the double fork.
-     */
-    pid = fork();
-    if (pid < 0) {
-	perror("fork");
-        sfree(args);
-	return;
-    }
-
-    if (pid == 0) {
-	int pid2 = fork();
-	if (pid2 < 0) {
-	    perror("fork");
-	    _exit(1);
-	} else if (pid2 > 0) {
-	    /*
-	     * First child has successfully forked second child. My
-	     * Work Here Is Done. Note the use of _exit rather than
-	     * exit: the latter appears to cause destroy messages
-	     * to be sent to the X server. I suspect gtk uses
-	     * atexit.
-	     */
-	    _exit(0);
-	}
-
-	/*
-	 * If we reach here, we are the second child, so we now
-	 * actually perform the exec.
-	 */
-	if (fd_to_close >= 0)
-	    close(fd_to_close);
-
-	execv("/proc/self/exe", args);
-	execvp(inst->progname, args);
-	perror("exec");
-	_exit(127);
-
-    } else {
-	int status;
-        sfree(args);
-	waitpid(pid, &status, 0);
-    }
-
-}
-
 void dup_session_menuitem(GtkMenuItem *item, gpointer gdata)
 {
     struct gui_data *inst = (struct gui_data *)gdata;
-    /*
-     * For this feature we must marshal conf and (possibly) pty_argv
-     * into a byte stream, create a pipe, and send this byte stream
-     * to the child through the pipe.
-     */
-    int i, ret, sersize, size;
-    char *data;
-    char option[80];
-    int pipefd[2];
 
-    if (pipe(pipefd) < 0) {
-	perror("pipe");
-	return;
-    }
-
-    size = sersize = conf_serialised_size(inst->conf);
-    if (use_pty_argv && pty_argv) {
-	for (i = 0; pty_argv[i]; i++)
-	    size += strlen(pty_argv[i]) + 1;
-    }
-
-    data = snewn(size, char);
-    conf_serialise(inst->conf, data);
-    if (use_pty_argv && pty_argv) {
-	int p = sersize;
-	for (i = 0; pty_argv[i]; i++) {
-	    strcpy(data + p, pty_argv[i]);
-	    p += strlen(pty_argv[i]) + 1;
-	}
-	assert(p == size);
-    }
-
-    sprintf(option, "---[%d,%d]", pipefd[0], size);
-    noncloexec(pipefd[0]);
-    fork_and_exec_self(inst, pipefd[1], option, NULL);
-    close(pipefd[0]);
-
-    i = ret = 0;
-    while (i < size && (ret = write(pipefd[1], data + i, size - i)) > 0)
-	i += ret;
-    if (ret < 0)
-	perror("write to pipe");
-    close(pipefd[1]);
-    sfree(data);
-}
-
-int read_dupsession_data(struct gui_data *inst, Conf *conf, char *arg)
-{
-    int fd, i, ret, size, size_used;
-    char *data;
-
-    if (sscanf(arg, "---[%d,%d]", &fd, &size) != 2) {
-	fprintf(stderr, "%s: malformed magic argument `%s'\n", appname, arg);
-	exit(1);
-    }
-
-    data = snewn(size, char);
-    i = ret = 0;
-    while (i < size && (ret = read(fd, data + i, size - i)) > 0)
-	i += ret;
-    if (ret < 0) {
-	perror("read from pipe");
-	exit(1);
-    } else if (i < size) {
-	fprintf(stderr, "%s: unexpected EOF in Duplicate Session data\n",
-		appname);
-	exit(1);
-    }
-
-    size_used = conf_deserialise(conf, data, size);
-    if (use_pty_argv && size > size_used) {
-	int n = 0;
-	i = size_used;
-	while (i < size) {
-	    while (i < size && data[i]) i++;
-	    if (i >= size) {
-		fprintf(stderr, "%s: malformed Duplicate Session data\n",
-			appname);
-		exit(1);
-	    }
-	    i++;
-	    n++;
-	}
-	pty_argv = snewn(n+1, char *);
-	pty_argv[n] = NULL;
-	n = 0;
-	i = size_used;
-	while (i < size) {
-	    char *p = data + i;
-	    while (i < size && data[i]) i++;
-	    assert(i < size);
-	    i++;
-	    pty_argv[n++] = dupstr(p);
-	}
-    }
-
-    sfree(data);
-
-    return 0;
+    launch_duplicate_session(inst->conf);
 }
 
 void new_session_menuitem(GtkMenuItem *item, gpointer data)
 {
-    struct gui_data *inst = (struct gui_data *)data;
-
-    fork_and_exec_self(inst, -1, NULL);
+    launch_new_session();
 }
 
 void restart_session_menuitem(GtkMenuItem *item, gpointer data)
@@ -4607,10 +3998,9 @@ void restart_session_menuitem(GtkMenuItem *item, gpointer data)
 
 void saved_session_menuitem(GtkMenuItem *item, gpointer data)
 {
-    struct gui_data *inst = (struct gui_data *)data;
     char *str = (char *)g_object_get_data(G_OBJECT(item), "user-data");
 
-    fork_and_exec_self(inst, -1, "-load", str, NULL);
+    launch_saved_session(str);
 }
 
 void saved_session_freedata(GtkMenuItem *item, gpointer data)
@@ -4803,12 +4193,9 @@ static void start_backend(struct gui_data *inst)
     gtk_widget_set_sensitive(inst->restartitem, FALSE);
 }
 
-int pt_main(int argc, char **argv)
+struct gui_data *new_session_window(Conf *conf, const char *geometry_string)
 {
-    extern int cfgbox(Conf *conf);
     struct gui_data *inst;
-
-    setlocale(LC_CTYPE, "");
 
     /*
      * Create an instance structure and initialise to zeroes
@@ -4817,58 +4204,32 @@ int pt_main(int argc, char **argv)
     memset(inst, 0, sizeof(*inst));
     inst->alt_keycode = -1;            /* this one needs _not_ to be zero */
     inst->busy_status = BUSY_NOT;
-    inst->conf = conf_new();
+    inst->conf = conf;
     inst->wintitle = inst->icontitle = NULL;
-    inst->quit_fn_scheduled = FALSE;
-    inst->idle_fn_scheduled = FALSE;
     inst->drawtype = DRAWTYPE_DEFAULT;
 #if GTK_CHECK_VERSION(3,4,0)
     inst->cumulative_scroll = 0.0;
 #endif
 
-    /* defer any child exit handling until we're ready to deal with
-     * it */
-    block_signal(SIGCHLD, 1);
+#ifndef NOT_X_WINDOWS
+    if (geometry_string) {
+        int flags, x, y;
+        unsigned int w, h;
+        flags = XParseGeometry(geometry_string, &x, &y, &w, &h);
+        if (flags & WidthValue)
+            conf_set_int(conf, CONF_width, w);
+        if (flags & HeightValue)
+            conf_set_int(conf, CONF_height, h);
 
-    inst->progname = argv[0];
-    /*
-     * Copy the original argv before letting gtk_init fiddle with
-     * it. It will be required later.
-     */
-    {
-	int i, oldargc;
-	inst->gtkargvstart = snewn(argc-1, char *);
-	for (i = 1; i < argc; i++)
-	    inst->gtkargvstart[i-1] = dupstr(argv[i]);
-	oldargc = argc;
-	gtk_init(&argc, &argv);
-	inst->ngtkargs = oldargc - argc;
+        if (flags & (XValue | YValue)) {
+            inst->xpos = x;
+            inst->ypos = y;
+            inst->gotpos = TRUE;
+            inst->gravity = ((flags & XNegative ? 1 : 0) |
+                             (flags & YNegative ? 2 : 0));
+        }
     }
-
-    if (argc > 1 && !strncmp(argv[1], "---", 3)) {
-	read_dupsession_data(inst, inst->conf, argv[1]);
-	/* Splatter this argument so it doesn't clutter a ps listing */
-	smemclr(argv[1], strlen(argv[1]));
-    } else {
-	/* By default, we bring up the config dialog, rather than launching
-	 * a session. This gets set to TRUE if something happens to change
-	 * that (e.g., a hostname is specified on the command-line). */
-	int allow_launch = FALSE;
-	if (do_cmdline(argc, argv, 0, &allow_launch, inst, inst->conf))
-	    exit(1);		       /* pre-defaults pass to get -class */
-	do_defaults(NULL, inst->conf);
-	if (do_cmdline(argc, argv, 1, &allow_launch, inst, inst->conf))
-	    exit(1);		       /* post-defaults, do everything */
-
-	cmdline_run_saved(inst->conf);
-
-	if (loaded_session)
-	    allow_launch = TRUE;
-
-	if ((!allow_launch || !conf_launchable(inst->conf)) &&
-	    !cfgbox(inst->conf))
-	    exit(0);		       /* config box hit Cancel */
-    }
+#endif
 
     if (!compound_text_atom)
         compound_text_atom = gdk_atom_intern("COMPOUND_TEXT", FALSE);
@@ -4888,7 +4249,7 @@ int pt_main(int argc, char **argv)
             exit(1);
         }
     }
-    inst->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    inst->window = make_gtk_toplevel_window(inst);
     {
         const char *winclass = conf_get_str(inst->conf, CONF_winclass);
         if (*winclass)
@@ -4907,23 +4268,6 @@ int pt_main(int argc, char **argv)
 
     init_clipboard(inst);
 
-    set_geom_hints(inst);
-
-#if GTK_CHECK_VERSION(3,0,0)
-    gtk_window_set_default_geometry(GTK_WINDOW(inst->window),
-                                    inst->width, inst->height);
-#else
-    {
-        int w = inst->font_width * inst->width + 2*inst->window_border;
-        int h = inst->font_height * inst->height + 2*inst->window_border;
-#if GTK_CHECK_VERSION(2,0,0)
-        gtk_widget_set_size_request(inst->area, w, h);
-#else
-        gtk_drawing_area_size(GTK_DRAWING_AREA(inst->area), w, h);
-#endif
-    }
-#endif
-
     inst->sbar_adjust = GTK_ADJUSTMENT(gtk_adjustment_new(0,0,0,0,0,0));
     inst->sbar = gtk_vscrollbar_new(inst->sbar_adjust);
     inst->hbox = GTK_BOX(gtk_hbox_new(FALSE, 0));
@@ -4941,15 +4285,52 @@ int pt_main(int argc, char **argv)
     gtk_container_add(GTK_CONTAINER(inst->window), GTK_WIDGET(inst->hbox));
 
     gtk_widget_show(inst->area);
-    if (conf_get_int(inst->conf, CONF_scrollbar))
-	gtk_widget_show(inst->sbar);
-    else
-	gtk_widget_hide(inst->sbar);
+    show_scrollbar(inst, conf_get_int(inst->conf, CONF_scrollbar));
     gtk_widget_show(GTK_WIDGET(inst->hbox));
 
+    /*
+     * We must call gtk_widget_realize before setting up the geometry
+     * hints, so that GtkApplicationWindow will have actually created
+     * its menu bar (if it's going to) and hence compute_geom_hints
+     * can find it to take its size into account.
+     */
+    gtk_widget_realize(inst->window);
+    set_geom_hints(inst);
+
+#if GTK_CHECK_VERSION(3,0,0)
+    {
+        int wp, hp;
+        compute_whole_window_size(inst, inst->width, inst->height, &wp, &hp);
+        gtk_window_set_default_size(GTK_WINDOW(inst->window), wp, hp);
+    }
+#else
+    {
+        int w = inst->font_width * inst->width + 2*inst->window_border;
+        int h = inst->font_height * inst->height + 2*inst->window_border;
 #if GTK_CHECK_VERSION(2,0,0)
-    if (inst->geometry) {
-        gtk_window_parse_geometry(GTK_WINDOW(inst->window), inst->geometry);
+        gtk_widget_set_size_request(inst->area, w, h);
+#else
+        gtk_drawing_area_size(GTK_DRAWING_AREA(inst->area), w, h);
+#endif
+    }
+#endif
+
+#if GTK_CHECK_VERSION(2,0,0)
+    if (inst->gotpos) {
+        static const GdkGravity gravities[] = {
+            GDK_GRAVITY_NORTH_WEST,
+            GDK_GRAVITY_NORTH_EAST,
+            GDK_GRAVITY_SOUTH_WEST,
+            GDK_GRAVITY_SOUTH_EAST,
+        };
+        int x = inst->xpos, y = inst->ypos;
+        int wp, hp;
+        compute_whole_window_size(inst, inst->width, inst->height, &wp, &hp);
+        if (inst->gravity & 1) x += (gdk_screen_width() - wp);
+        if (inst->gravity & 2) y += (gdk_screen_height() - hp);
+        gtk_window_set_gravity(GTK_WINDOW(inst->window),
+                               gravities[inst->gravity & 3]);
+	gtk_window_move(GTK_WINDOW(inst->window), x, y);
     }
 #else
     if (inst->gotpos) {
@@ -5101,13 +4482,9 @@ int pt_main(int argc, char **argv)
 
     inst->eventlogstuff = eventlogstuff_new();
 
-    request_callback_notifications(notify_toplevel_callback, inst);
-
     inst->term = term_init(inst->conf, &inst->ucsdata, inst);
     inst->logctx = log_init(inst, inst->conf);
     term_provide_logctx(inst->term, inst->logctx);
-
-    uxsel_init();
 
     term_size(inst->term, inst->height, inst->width,
 	      conf_get_int(inst->conf, CONF_savelines));
@@ -5116,22 +4493,7 @@ int pt_main(int argc, char **argv)
 
     ldisc_echoedit_update(inst->ldisc);     /* cause ldisc to notice changes */
 
-    /* now we're reday to deal with the child exit handler being
-     * called */
-    block_signal(SIGCHLD, 0);
-
-    /*
-     * Block SIGPIPE: if we attempt Duplicate Session or similar
-     * and it falls over in some way, we certainly don't want
-     * SIGPIPE terminating the main pterm/PuTTY. Note that we do
-     * this _after_ (at least pterm) forks off its child process,
-     * since the child wants SIGPIPE handled in the usual way.
-     */
-    block_signal(SIGPIPE, 1);
-
     inst->exited = FALSE;
 
-    gtk_main();
-
-    return 0;
+    return inst;
 }

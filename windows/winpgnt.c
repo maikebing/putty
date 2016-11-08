@@ -16,6 +16,7 @@
 #include "tree234.h"
 #include "winsecur.h"
 #include "pageant.h"
+#include "licence.h"
 
 #include <shellapi.h>
 
@@ -48,7 +49,7 @@
 
 #define APPNAME "Pageant"
 
-extern char ver[];
+extern const char ver[];
 
 static HWND keylist;
 static HWND aboutbox;
@@ -125,6 +126,7 @@ static INT_PTR CALLBACK LicenceProc(HWND hwnd, UINT msg,
 {
     switch (msg) {
       case WM_INITDIALOG:
+        SetDlgItemText(hwnd, 1000, LICENCE_TEXT("\r\n\r\n"));
 	return 1;
       case WM_COMMAND:
 	switch (LOWORD(wParam)) {
@@ -149,7 +151,14 @@ static INT_PTR CALLBACK AboutProc(HWND hwnd, UINT msg,
 {
     switch (msg) {
       case WM_INITDIALOG:
-	SetDlgItemText(hwnd, 100, ver);
+        {
+            char *text = dupprintf
+                ("Pageant\r\n\r\n%s\r\n\r\n%s",
+                 ver,
+                 "\251 " SHORT_COPYRIGHT_DETAILS ". All rights reserved.");
+            SetDlgItemText(hwnd, 1000, text);
+            sfree(text);
+        }
 	return 1;
       case WM_COMMAND:
 	switch (LOWORD(wParam)) {
@@ -292,11 +301,32 @@ void keylist_update(void)
 	for (i = 0; NULL != (skey = pageant_nth_ssh2_key(i)); i++) {
 	    char *listentry, *p;
 	    int pos;
-	    /*
-	     * Replace spaces with tabs in the fingerprint prefix, for
-	     * nice alignment in the list box, until we encounter a :
-	     * meaning we're into the fingerprint proper.
-	     */
+
+            /*
+             * For nice alignment in the list box, we would ideally
+             * want every entry to align to the tab stop settings, and
+             * have a column for algorithm name, one for bit count,
+             * one for hex fingerprint, and one for key comment.
+             *
+             * Unfortunately, some of the algorithm names are so long
+             * that they overflow into the bit-count field.
+             * Fortunately, at the moment, those are _precisely_ the
+             * algorithm names that don't need a bit count displayed
+             * anyway (because for NIST-style ECDSA the bit count is
+             * mentioned in the algorithm name, and for ssh-ed25519
+             * there is only one possible value anyway). So we fudge
+             * this by simply omitting the bit count field in that
+             * situation.
+             *
+             * This is fragile not only in the face of further key
+             * types that don't follow this pattern, but also in the
+             * face of font metrics changes - the Windows semantics
+             * for list box tab stops is that \t aligns to the next
+             * one you haven't already exceeded, so I have to guess
+             * when the key type will overflow past the bit-count tab
+             * stop and leave out a tab character. Urgh.
+             */
+
 	    p = ssh2_fingerprint(skey->alg, skey->data);
             listentry = dupprintf("%s\t%s", p, skey->comment);
             sfree(p);
@@ -307,6 +337,26 @@ void keylist_update(void)
                 if (listentry[pos] == ':' || !listentry[pos])
                     break;
                 listentry[pos++] = '\t';
+            }
+            if (skey->alg != &ssh_dss && skey->alg != &ssh_rsa) {
+                /*
+                 * Remove the bit-count field, which is between the
+                 * first and second \t.
+                 */
+                int outpos;
+                pos = 0;
+                while (listentry[pos] && listentry[pos] != '\t')
+                    pos++;
+                outpos = pos;
+                pos++;
+                while (listentry[pos] && listentry[pos] != '\t')
+                    pos++;
+                while (1) {
+                    if ((listentry[outpos] = listentry[pos]) == '\0')
+                        break;
+                    outpos++;
+                    pos++;
+                }
             }
 
 	    SendDlgItemMessage(keylist, 100, LB_ADDSTRING, 0,
@@ -912,7 +962,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
 			debug(("couldn't get default SID\n"));
 #endif
                         CloseHandle(filemap);
-                        sfree(ourself);
 			return 0;
                     }
 
@@ -925,7 +974,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                                rc));
 #endif
                         CloseHandle(filemap);
-                        sfree(ourself);
                         sfree(ourself2);
 			return 0;
 		    }
@@ -946,7 +994,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                         !EqualSid(mapowner, ourself2)) {
                         CloseHandle(filemap);
                         LocalFree(psd);
-                        sfree(ourself);
                         sfree(ourself2);
 			return 0;      /* security ID mismatch! */
                     }
@@ -954,7 +1001,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
 		    debug(("security stuff matched\n"));
 #endif
                     LocalFree(psd);
-                    sfree(ourself);
                     sfree(ourself2);
 		} else {
 #ifdef DEBUG_IPC
@@ -1025,6 +1071,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     int added_keys = 0;
     int argc, i;
     char **argv, **argstart;
+
+    dll_hijacking_protection();
 
     hinst = inst;
     hwnd = NULL;
@@ -1127,6 +1175,23 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 	    added_keys = TRUE;
 	}
     }
+
+#if !defined UNPROTECT && !defined NO_SECURITY
+    /*
+     * Protect our process.
+     */
+    {
+        char *error = NULL;
+        if (!setprocessacl(error)) {
+            char *message = dupprintf("Could not restrict process ACL: %s",
+                                      error);
+            MessageBox(NULL, message, "Pageant Warning",
+                       MB_ICONWARNING | MB_OK);
+            sfree(message);
+            sfree(error);
+        }
+    }
+#endif
 
     /*
      * Forget any passphrase that we retained while going over

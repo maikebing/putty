@@ -62,6 +62,8 @@ void align_label_left(GtkLabel *label)
 {
 #if GTK_CHECK_VERSION(3,16,0)
     gtk_label_set_xalign(label, 0.0);
+#elif GTK_CHECK_VERSION(3,14,0)
+    gtk_widget_set_halign(GTK_WIDGET(label), GTK_ALIGN_START);
 #else
     gtk_misc_set_alignment(GTK_MISC(label), 0.0, 0.0);
 #endif
@@ -173,6 +175,8 @@ GtkBox *our_dialog_make_action_hbox(GtkWindow *dlg)
 #if GTK_CHECK_VERSION(3,0,0)
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     our_dialog_set_action_area(dlg, hbox);
+    g_object_set(G_OBJECT(hbox), "margin", 0, (const char *)NULL);
+    g_object_set(G_OBJECT(hbox), "spacing", 8, (const char *)NULL);
     gtk_widget_show(hbox);
     return GTK_BOX(hbox);
 #else /* not GTK 3 */

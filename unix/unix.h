@@ -11,6 +11,7 @@
 #include <dlfcn.h>		       /* Dynamic library loading */
 #endif /*  NO_LIBDL */
 #include "charset.h"
+#include <sys/types.h>         /* for mode_t */
 
 #ifdef OSX_GTK
 /*
@@ -74,7 +75,7 @@ typedef uint32_t uint32; /* C99: uint32_t defined in stdint.h */
 #define SEL_NL { 10 }
 
 /* Simple wraparound timer function */
-unsigned long getticks(void);	       /* based on gettimeofday(2) */
+unsigned long getticks(void);
 #define GETTICKCOUNT getticks
 #define TICKSPERSEC    1000	       /* we choose to use milliseconds */
 #define CURSORBLINK     450	       /* no standard way to set this */
@@ -93,6 +94,21 @@ unsigned long getticks(void);	       /* based on gettimeofday(2) */
  * premsg() before outputting text to stderr and postmsg() afterwards.
  */
 #define FLAG_STDERR_TTY 0x1000
+
+/* The per-session frontend structure managed by gtkwin.c */
+struct gui_data;
+struct gui_data *new_session_window(Conf *conf, const char *geometry_string);
+
+/* Defined in gtkmain.c */
+void launch_duplicate_session(Conf *conf);
+void launch_new_session(void);
+void launch_saved_session(const char *str);
+#ifdef MAY_REFER_TO_GTK_IN_HEADERS
+GtkWidget *make_gtk_toplevel_window(void *frontend);
+#endif
+
+/* Defined in gtkcomm.c */
+void gtkcomm_setup(void);
 
 /* Things pty.c needs from pterm.c */
 const char *get_x_display(void *frontend);
@@ -116,7 +132,7 @@ void logevent_dlg(void *estuff, const char *string);
 int reallyclose(void *frontend);
 #ifdef MAY_REFER_TO_GTK_IN_HEADERS
 int messagebox(GtkWidget *parentwin, const char *title,
-               const char *msg, int minwid, ...);
+               const char *msg, int minwid, int selectable, ...);
 #endif
 
 /* Things pterm.c needs from {ptermm,uxputty}.c */
@@ -182,6 +198,7 @@ void noncloexec(int);
 int nonblock(int);
 int no_nonblock(int);
 char *make_dir_and_check_ours(const char *dirname);
+char *make_dir_path(const char *path, mode_t mode);
 
 /*
  * Exports from unicode.c.

@@ -306,6 +306,9 @@ char *get_ttymode(void *frontend, const char *mode)
 #if defined(XCASE)
     GET_BOOL("XCASE", XCASE, c_lflag, );
 #endif
+#if defined(IUTF8)
+    GET_BOOL("IUTF8", IUTF8, c_iflag, );
+#endif
     /* Configuration of ECHO */
 #if defined(ECHOCTL)
     GET_BOOL("ECHOCTL", ECHOCTL, c_lflag, );
@@ -946,6 +949,11 @@ int main(int argc, char **argv)
 	perror("pipe");
 	exit(1);
     }
+    /* We don't want the signal handler to block if the pipe's full. */
+    nonblock(signalpipe[0]);
+    nonblock(signalpipe[1]);
+    cloexec(signalpipe[0]);
+    cloexec(signalpipe[1]);
     putty_signal(SIGWINCH, sigwinch);
 
     /*
@@ -961,7 +969,7 @@ int main(int argc, char **argv)
     uxsel_init();
 
     /*
-     * Unix Plink doesn't provide any way to add forwardings after the
+     * Plink doesn't provide any way to add forwardings after the
      * connection is set up, so if there are none now, we can safely set
      * the "simple" flag.
      */

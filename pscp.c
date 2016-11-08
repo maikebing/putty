@@ -658,6 +658,10 @@ int sftp_senddata(char *buf, int len)
     back->send(backhandle, buf, len);
     return 1;
 }
+int sftp_sendbuffer(void)
+{
+    return back->sendbuffer(backhandle);
+}
 
 /* ----------------------------------------------------------------------
  * sftp-based replacement for the hacky `pscp -ls'.
@@ -1495,7 +1499,7 @@ int scp_get_sink_action(struct scp_sink_action *act)
 	{
 	    char sizestr[40];
 	
-	    if (sscanf(act->buf, "%lo %s %n", &act->permissions,
+            if (sscanf(act->buf, "%lo %39s %n", &act->permissions,
                        sizestr, &i) != 2)
 		bump("Protocol error: Illegal file descriptor format");
 	    act->size = uint64_from_decimal(sizestr);
@@ -1711,11 +1715,12 @@ static void source(const char *src)
     stat_starttime = time(NULL);
     stat_lasttime = 0;
 
+#define PSCP_SEND_BLOCK 4096
     for (i = uint64_make(0,0);
 	 uint64_compare(i,size) < 0;
-	 i = uint64_add32(i,4096)) {
-	char transbuf[4096];
-	int j, k = 4096;
+	 i = uint64_add32(i,PSCP_SEND_BLOCK)) {
+	char transbuf[PSCP_SEND_BLOCK];
+	int j, k = PSCP_SEND_BLOCK;
 
 	if (uint64_compare(uint64_add32(i, k),size) > 0) /* i + k > size */ 
 	    k = (uint64_subtract(size, i)).lo; 	/* k = size - i; */
@@ -2348,6 +2353,8 @@ int psftp_main(int argc, char *argv[])
     argc -= i;
     argv += i;
     back = NULL;
+
+    platform_psftp_post_option_setup();
 
     if (list) {
 	if (argc != 1)

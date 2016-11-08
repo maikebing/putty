@@ -182,7 +182,14 @@ typedef enum {
     /* Pseudo-specials used for constructing the specials menu. */
     TS_SEP,	    /* Separator */
     TS_SUBMENU,	    /* Start a new submenu with specified name */
-    TS_EXITMENU	    /* Exit current submenu or end of specials */
+    TS_EXITMENU,    /* Exit current submenu or end of specials */
+    /* Starting point for protocols to invent special-action codes
+     * that can't live in this enum at all, e.g. because they change
+     * with every session.
+     *
+     * Of course, this must remain the last value in this
+     * enumeration. */
+    TS_LOCALSTART
 } Telnet_Special;
 
 struct telnet_special {
@@ -261,6 +268,18 @@ enum {
 
 enum {
     /*
+     * SSH-2 host key algorithms
+     */
+    HK_WARN,
+    HK_RSA,
+    HK_DSA,
+    HK_ECDSA,
+    HK_ED25519,
+    HK_MAX
+};
+
+enum {
+    /*
      * SSH ciphers (both SSH-1 and SSH-2)
      */
     CIPHER_WARN,		       /* pseudo 'cipher' */
@@ -279,9 +298,9 @@ enum {
      * three-way settings whose values are `always yes', `always
      * no', and `decide by some more complex automated means'. This
      * is true of line discipline options (local echo and line
-     * editing), proxy DNS, Close On Exit, and SSH server bug
-     * workarounds. Accordingly I supply a single enum here to deal
-     * with them all.
+     * editing), proxy DNS, proxy terminal logging, Close On Exit, and
+     * SSH server bug workarounds. Accordingly I supply a single enum
+     * here to deal with them all.
      */
     FORCE_ON, FORCE_OFF, AUTO
 };
@@ -681,12 +700,14 @@ void cleanup_exit(int);
     X(STR, NONE, proxy_username) \
     X(STR, NONE, proxy_password) \
     X(STR, NONE, proxy_telnet_command) \
+    X(INT, NONE, proxy_log_to_term) \
     /* SSH options */ \
     X(STR, NONE, remote_cmd) \
     X(STR, NONE, remote_cmd2) /* fallback if remote_cmd fails; never loaded or saved */ \
     X(INT, NONE, nopty) \
     X(INT, NONE, compression) \
     X(INT, INT, ssh_kexlist) \
+    X(INT, INT, ssh_hklist) \
     X(INT, NONE, ssh_rekey_time) /* in minutes */ \
     X(STR, NONE, ssh_rekey_data) /* string encoding e.g. "100K", "2M", "1G" */ \
     X(INT, NONE, tryagent) \
@@ -694,7 +715,20 @@ void cleanup_exit(int);
     X(INT, NONE, change_username) /* allow username switching in SSH-2 */ \
     X(INT, INT, ssh_cipherlist) \
     X(FILENAME, NONE, keyfile) \
-    X(INT, NONE, sshprot) /* use v1 or v2 when both available */ \
+    /* \
+     * Which SSH protocol to use. \
+     * For historical reasons, the current legal values for CONF_sshprot \
+     * are: \
+     *  0 = SSH-1 only \
+     *  3 = SSH-2 only \
+     * We used to also support \
+     *  1 = SSH-1 with fallback to SSH-2 \
+     *  2 = SSH-2 with fallback to SSH-1 \
+     * and we continue to use 0/3 in storage formats rather than the more \
+     * obvious 1/2 to avoid surprises if someone saves a session and later \
+     * downgrades PuTTY. So it's easier to use these numbers internally too. \
+     */ \
+    X(INT, NONE, sshprot) \
     X(INT, NONE, ssh2_des_cbc) /* "des-cbc" unrecommended SSH-2 cipher */ \
     X(INT, NONE, ssh_no_userauth) /* bypass "ssh-userauth" (SSH-2 only) */ \
     X(INT, NONE, ssh_show_banner) /* show USERAUTH_BANNERs (SSH-2 only) */ \
@@ -1124,7 +1158,7 @@ void ser_setup_config_box(struct controlbox *b, int midsession,
 /*
  * Exports from version.c.
  */
-extern char ver[];
+extern const char ver[];
 
 /*
  * Exports from unicode.c.
@@ -1207,14 +1241,21 @@ int verify_ssh_host_key(void *frontend, char *host, int port,
                         void (*callback)(void *ctx, int result), void *ctx);
 /*
  * have_ssh_host_key() just returns true if a key of that type is
- * already chached and false otherwise.
+ * already cached and false otherwise.
  */
 int have_ssh_host_key(const char *host, int port, const char *keytype);
 /*
- * askalg has the same set of return values as verify_ssh_host_key.
+ * askalg and askhk have the same set of return values as
+ * verify_ssh_host_key.
+ *
+ * (askhk is used in the case where we're using a host key below the
+ * warning threshold because that's all we have cached, but at least
+ * one acceptable algorithm is available that we don't have cached.)
  */
 int askalg(void *frontend, const char *algtype, const char *algname,
 	   void (*callback)(void *ctx, int result), void *ctx);
+int askhk(void *frontend, const char *algname, const char *betteralgs,
+          void (*callback)(void *ctx, int result), void *ctx);
 /*
  * askappend can return four values:
  * 
@@ -1324,7 +1365,7 @@ void filename_free(Filename *fn);
 int filename_serialise(const Filename *f, void *data);
 Filename *filename_deserialise(void *data, int maxsize, int *used);
 char *get_username(void);	       /* return value needs freeing */
-char *get_random_data(int bytes);      /* used in cmdgen.c */
+char *get_random_data(int bytes, const char *device); /* used in cmdgen.c */
 char filename_char_sanitise(char c);   /* rewrite special pathname chars */
 
 /*
@@ -1422,6 +1463,7 @@ unsigned long schedule_timer(int ticks, timer_fn_t fn, void *ctx);
 void expire_timer_context(void *ctx);
 int run_timers(unsigned long now, unsigned long *next);
 void timer_change_notify(unsigned long next);
+unsigned long timing_last_clock(void);
 
 /*
  * Exports from callback.c.

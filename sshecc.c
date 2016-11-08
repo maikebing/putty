@@ -2760,11 +2760,8 @@ void *ssh_ecdhkex_newkey(const struct ssh_kex *kex)
         bytes[0] &= 248;
         bytes[31] &= 127;
         bytes[31] |= 64;
-        key->privateKey = bignum_from_bytes(bytes, sizeof(bytes));
-        for (i = 0; i < sizeof(bytes); ++i)
-        {
-            ((volatile char*)bytes)[i] = 0;
-        }
+        key->privateKey = bignum_from_bytes_le(bytes, sizeof(bytes));
+        smemclr(bytes, sizeof(bytes));
         if (!key->privateKey) {
             sfree(key);
             return NULL;
@@ -2939,6 +2936,9 @@ const unsigned char *ec_alg_oid(const struct ssh_signkey *alg,
     *oidlen = extra->oidlen;
     return extra->oid;
 }
+
+const int ec_nist_curve_lengths[] = { 256, 384, 521 };
+const int n_ec_nist_curve_lengths = lenof(ec_nist_curve_lengths);
 
 const int ec_nist_alg_and_curve_by_bits(int bits,
                                         const struct ec_curve **curve,
